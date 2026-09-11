@@ -4,6 +4,32 @@ import io from "socket.io-client";
 
 const ENDPOINT = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
+const initialsFor = (name = "") => {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return "?";
+  return `${parts[0]?.[0] || ""}${parts[1]?.[0] || ""}`.toUpperCase();
+};
+
+const Avatar = ({ user, large = false }) => {
+  const [failed, setFailed] = useState(false);
+  const hasImage = Boolean(user?.pic) && !failed;
+
+  return (
+    <div className={`avatar ${large ? "large" : ""}`} aria-label={user?.name || "User"}>
+      {hasImage ? (
+        <img
+          src={user.pic}
+          alt=""
+          onError={() => setFailed(true)}
+          referrerPolicy="no-referrer"
+        />
+      ) : (
+        <span>{initialsFor(user?.name)}</span>
+      )}
+    </div>
+  );
+};
+
 const Chat = () => {
   const navigate = useNavigate();
   const [users, setUsers] = useState([]);
@@ -16,9 +42,12 @@ const Chat = () => {
   const [onlineUsers, setOnlineUsers] = useState([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [sending, setSending] = useState(false);
+
   const socketRef = useRef(null);
   const typingTimer = useRef(null);
   const messagesEndRef = useRef(null);
+  const selectedUserRef = useRef(null);
 
   const token = localStorage.getItem("token");
 
@@ -26,6 +55,10 @@ const Chat = () => {
     () => ({ "auth-token": token || "", "Content-Type": "application/json" }),
     [token]
   );
+
+  useEffect(() => {
+    selectedUserRef.current = selectedUser;
+  }, [selectedUser]);
 
   useEffect(() => {
     if (!token) navigate("/login");
@@ -38,17 +71,20 @@ const Chat = () => {
         const response = await fetch(`${ENDPOINT}/api/auth/getuser`, {
           headers: { "auth-token": token },
         });
+
         if (response.status === 401) {
           localStorage.removeItem("token");
           navigate("/login");
           return;
         }
+
         if (!response.ok) throw new Error("Unable to load your profile");
         setLoggedInUser(await response.json());
       } catch (err) {
         setError(err.message);
       }
     };
+
     loadMe();
   }, [token, navigate]);
 
@@ -60,6 +96,13 @@ const Chat = () => {
         const response = await fetch(`${ENDPOINT}/api/auth/getalluser`, {
           headers: { "auth-token": token },
         });
+
+        if (response.status === 401) {
+          localStorage.removeItem("token");
+          navigate("/login");
+          return;
+        }
+
         if (!response.ok) throw new Error("Unable to load users");
         setUsers(await response.json());
       } catch (err) {
@@ -68,79 +111,125 @@ const Chat = () => {
         setLoading(false);
       }
     };
+
     loadUsers();
-  }, [loggedInUser, token]);
-
-  useEffect(() => {
-    if (!loggedInUser?._id) return;
-
-    const socket = io(ENDPOINT, { withCredentials: true });
-    socketRef.current = socket;
-    socket.emit("join", loggedInUser._id);
-
-    socket.on("online_users", (ids) => setOnlineUsers(ids));
-
-    socket.on("receive_message", (message) => {
-      const senderId = typeof message.sender === "object" ? message.sender?._id : message.sender;
-      if (senderId === selectedUser?._id) {
-        setMessages((prev) => [...prev, message]);
-        markConversationSeen(selectedUser._id, socket);
-      }
-    });
-
-    socket.on("typing", (senderId) => {
-      if (senderId === selectedUser?._id) setTypingUser(senderId);
-    });
-
-    socket.on("stop_typing", (senderId) => {
-      if (senderId === selectedUser?._id) setTypingUser(null);
-    });
-
-    socket.on("messages_seen", ({ by }) => {
-      if (by === selectedUser?._id) {
-        setMessages((prev) =>
-          prev.map((msg) => ({ ...msg, seen: true, seenAt: msg.seenAt || new Date().toISOString() }))
-        );
-      }
-    });
-
-    return () => {
-      socket.disconnect();
-      socketRef.current = null;
-    };
-  }, [loggedInUser?._id, selectedUser?._id]);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, typingUser]);
+  }, [loggedInUser, token, navigate]);
 
   const markConversationSeen = async (otherUserId, socket = socketRef.current) => {
-    if (!otherUserId) return;
+    if (!otherUserId || !token) return;
+
     try {
-      await fetch(`${ENDPOINT}/api/message/seen/${otherUserId}`, {
+      const response = await fetch(`${ENDPOINT}/api/message/seen/${otherUserId}`, {
         method: "PATCH",
         headers: authHeaders,
       });
+
+      if (!response.ok) return;
+
       socket?.emit("messages_seen", {
         by: loggedInUser?._id,
         withUser: otherUserId,
       });
     } catch (err) {
-      console.error(err);
+      console.error("Unable to mark messages as seen:", err);
     }
   };
 
+  useEffect(() => {
+    if (!loggedInUser?._id) return;
+
+    const socket = io(ENDPOINT, {
+      withCredentials: true,
+      transports: ["websocket", "polling"],
+      reconnection: true,
+    });
+
+    socketRef.current = socket;
+
+    const joinCurrentUser = () => {
+      socket.emit("join", loggedInUser._id);
+      socket.emit("request_presence");
+    };
+
+    socket.on("connect", joinCurrentUser);
+    socket.on("online_users", (ids = []) => {
+      setOnlineUsers(ids.map(String));
+    });
+
+    socket.on("receive_message", (message) => {
+      const activeUser = selectedUserRef.current;
+      const sender = typeof message.sender === "object" ? message.sender?._id : message.sender;
+
+      if (activeUser && String(sender) === String(activeUser._id)) {
+        setMessages((prev) => {
+          if (message._id && prev.some((item) => item._id === message._id)) return prev;
+          return [...prev, message];
+        });
+        markConversationSeen(activeUser._id, socket);
+      }
+    });
+
+    socket.on("typing", (senderId) => {
+      const activeUser = selectedUserRef.current;
+      if (activeUser && String(senderId) === String(activeUser._id)) {
+        setTypingUser(String(senderId));
+      }
+    });
+
+    socket.on("stop_typing", (senderId) => {
+      const activeUser = selectedUserRef.current;
+      if (activeUser && String(senderId) === String(activeUser._id)) {
+        setTypingUser(null);
+      }
+    });
+
+    socket.on("messages_seen", ({ by }) => {
+      const activeUser = selectedUserRef.current;
+      if (activeUser && String(by) === String(activeUser._id)) {
+        setMessages((prev) =>
+          prev.map((msg) => ({
+            ...msg,
+            seen: true,
+            seenAt: msg.seenAt || new Date().toISOString(),
+          }))
+        );
+      }
+    });
+
+    return () => {
+      socket.removeAllListeners();
+      socket.disconnect();
+      socketRef.current = null;
+    };
+  }, [loggedInUser?._id]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, typingUser]);
+
   const handleUserSelect = async (user) => {
     setSelectedUser(user);
+    selectedUserRef.current = user;
     setTypingUser(null);
     setError("");
+    setMessages([]);
 
     try {
       const response = await fetch(`${ENDPOINT}/api/message/${user._id}`, {
         headers: { "auth-token": token },
       });
-      if (!response.ok) throw new Error("Unable to load messages");
-      const data = await response.json();
+
+      if (response.status === 401) {
+        localStorage.removeItem("token");
+        navigate("/login");
+        return;
+      }
+
+      const data = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(data?.error || "Unable to load messages");
+      }
+
       setMessages(Array.isArray(data) ? data : []);
       await markConversationSeen(user._id);
     } catch (err) {
@@ -151,7 +240,10 @@ const Chat = () => {
 
   const handleSend = async () => {
     const content = input.trim();
-    if (!content || !selectedUser) return;
+    if (!content || !selectedUser || sending) return;
+
+    setError("");
+    setSending(true);
 
     try {
       const response = await fetch(`${ENDPOINT}/api/message/send`, {
@@ -160,17 +252,30 @@ const Chat = () => {
         body: JSON.stringify({ receiver: selectedUser._id, content }),
       });
 
-      if (!response.ok) throw new Error("Message could not be sent");
-      const savedMessage = await response.json();
-      setMessages((prev) => [...prev, savedMessage]);
+      const data = await response.json().catch(() => null);
+
+      if (response.status === 401) {
+        localStorage.removeItem("token");
+        navigate("/login");
+        return;
+      }
+
+      if (!response.ok) {
+        throw new Error(data?.error || `Message could not be sent (${response.status})`);
+      }
+
+      setMessages((prev) => [...prev, data]);
       setInput("");
-      socketRef.current?.emit("send_message", savedMessage);
+
+      socketRef.current?.emit("send_message", data);
       socketRef.current?.emit("stop_typing", {
         sender: loggedInUser._id,
         receiver: selectedUser._id,
       });
     } catch (err) {
-      setError(err.message);
+      setError(err.message || "Message could not be sent");
+    } finally {
+      setSending(false);
     }
   };
 
@@ -202,10 +307,14 @@ const Chat = () => {
 
   const formatTime = (value) => {
     if (!value) return "";
-    return new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return new Date(value).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
   };
 
   const logout = () => {
+    socketRef.current?.disconnect();
     localStorage.removeItem("token");
     navigate("/login");
   };
@@ -235,6 +344,7 @@ const Chat = () => {
         <div className="user-list">
           {loading && <div className="empty">Loading users...</div>}
           {!loading && filteredUsers.length === 0 && <div className="empty">No users found</div>}
+
           {filteredUsers.map((user) => (
             <button
               key={user._id}
@@ -242,12 +352,12 @@ const Chat = () => {
               onClick={() => handleUserSelect(user)}
             >
               <div className="avatar-wrap">
-                <img src={user.pic} alt={user.name} className="avatar" />
+                <Avatar user={user} />
                 <span className={`presence ${isOnline(user._id) ? "online" : ""}`} />
               </div>
               <div className="user-meta">
                 <strong>{user.name}</strong>
-                <span>{isOnline(user._id) ? "Online" : user.email || "Offline"}</span>
+                <span>{isOnline(user._id) ? "Online" : "Offline"}</span>
               </div>
             </button>
           ))}
@@ -259,12 +369,18 @@ const Chat = () => {
           <>
             <header className="conversation-header">
               <div className="avatar-wrap">
-                <img src={selectedUser.pic} alt={selectedUser.name} className="avatar large" />
+                <Avatar user={selectedUser} large />
                 <span className={`presence ${isOnline(selectedUser._id) ? "online" : ""}`} />
               </div>
               <div>
                 <h3>{selectedUser.name}</h3>
-                <span>{typingUser ? "typing..." : isOnline(selectedUser._id) ? "Online now" : "Offline"}</span>
+                <span>
+                  {typingUser
+                    ? "typing..."
+                    : isOnline(selectedUser._id)
+                      ? "Online now"
+                      : "Offline"}
+                </span>
               </div>
             </header>
 
@@ -280,21 +396,30 @@ const Chat = () => {
               )}
 
               {messages.map((message, index) => {
-                const mine = senderId(message) === loggedInUser?._id;
+                const mine = String(senderId(message)) === String(loggedInUser?._id);
                 return (
-                  <div key={message._id || `${message.createdAt}-${index}`} className={`message-row ${mine ? "mine" : "theirs"}`}>
+                  <div
+                    key={message._id || `${message.createdAt}-${index}`}
+                    className={`message-row ${mine ? "mine" : "theirs"}`}
+                  >
                     <div className="message-bubble">
                       <div>{message.content}</div>
                       <div className="message-meta">
                         <span>{formatTime(message.createdAt)}</span>
-                        {mine && <span title={message.seen ? "Seen" : "Sent"}>{message.seen ? "✓✓" : "✓"}</span>}
+                        {mine && (
+                          <span title={message.seen ? "Seen" : "Sent"}>
+                            {message.seen ? "✓✓" : "✓"}
+                          </span>
+                        )}
                       </div>
                     </div>
                   </div>
                 );
               })}
 
-              {typingUser && <div className="typing-indicator"><span /><span /><span /></div>}
+              {typingUser && (
+                <div className="typing-indicator"><span /><span /><span /></div>
+              )}
               <div ref={messagesEndRef} />
             </section>
 
@@ -309,8 +434,11 @@ const Chat = () => {
                   }
                 }}
                 placeholder={`Message ${selectedUser.name}...`}
+                disabled={sending}
               />
-              <button onClick={handleSend} disabled={!input.trim()}>Send</button>
+              <button onClick={handleSend} disabled={!input.trim() || sending}>
+                {sending ? "Sending..." : "Send"}
+              </button>
             </footer>
           </>
         ) : (
@@ -329,7 +457,7 @@ const Chat = () => {
         .chat-shell { height: 100vh; display: grid; grid-template-columns: 360px 1fr; background: #0b0d12; }
         .sidebar { border-right: 1px solid #232631; background: #11131a; display: flex; flex-direction: column; min-width: 0; }
         .brand-row { display: flex; align-items: center; gap: 12px; padding: 22px; border-bottom: 1px solid #232631; }
-        .brand-avatar { width: 48px; height: 48px; border-radius: 16px; display: grid; place-items: center; font-weight: 800; background: linear-gradient(135deg,#7c3aed,#a855f7); }
+        .brand-avatar { width: 48px; height: 48px; flex: 0 0 48px; border-radius: 16px; display: grid; place-items: center; font-weight: 800; background: linear-gradient(135deg,#7c3aed,#a855f7); }
         .brand-row h2 { margin: 0; font-size: 21px; }
         .brand-row span { color: #8e95a6; font-size: 12px; }
         .ghost-btn { margin-left: auto; border: 1px solid #2c3040; color: #d9dded; background: #171a23; border-radius: 10px; padding: 8px 11px; cursor: pointer; }
@@ -339,10 +467,12 @@ const Chat = () => {
         .user-list { overflow-y: auto; padding: 6px 12px 20px; }
         .user-card { width: 100%; border: 0; background: transparent; color: white; display: flex; align-items: center; gap: 12px; padding: 12px; border-radius: 14px; text-align: left; cursor: pointer; }
         .user-card:hover, .user-card.active { background: #1b1e29; }
-        .avatar-wrap { position: relative; flex: 0 0 auto; }
-        .avatar { width: 44px; height: 44px; object-fit: cover; border-radius: 50%; background: #252938; }
-        .avatar.large { width: 48px; height: 48px; }
-        .presence { position: absolute; width: 12px; height: 12px; border-radius: 50%; right: 0; bottom: 1px; background: #5b6270; border: 2px solid #11131a; }
+        .avatar-wrap { position: relative; flex: 0 0 auto; width: 44px; height: 44px; }
+        .conversation-header .avatar-wrap { width: 48px; height: 48px; }
+        .avatar { width: 44px; height: 44px; min-width: 44px; max-width: 44px; flex: 0 0 44px; overflow: hidden; border-radius: 50%; background: #28223b; display: grid; place-items: center; color: #ddd6fe; font-size: 13px; font-weight: 800; line-height: 1; }
+        .avatar.large { width: 48px; height: 48px; min-width: 48px; max-width: 48px; flex-basis: 48px; }
+        .avatar img { display: block; width: 100%; height: 100%; max-width: 100%; object-fit: cover; border-radius: inherit; }
+        .presence { position: absolute; width: 12px; height: 12px; border-radius: 50%; right: -1px; bottom: 1px; background: #5b6270; border: 2px solid #11131a; }
         .presence.online { background: #22c55e; }
         .user-meta { min-width: 0; display: flex; flex-direction: column; }
         .user-meta strong { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -362,7 +492,7 @@ const Chat = () => {
         .composer { padding: 16px 22px 20px; display: flex; gap: 10px; border-top: 1px solid #202430; background: #0e1016; }
         .composer input { flex: 1; min-width: 0; border: 1px solid #2a2e3a; border-radius: 15px; background: #171a22; color: white; outline: none; padding: 14px 16px; }
         .composer input:focus { border-color: #7c3aed; }
-        .composer button { border: 0; border-radius: 14px; padding: 0 20px; background: #7c3aed; color: white; font-weight: 700; cursor: pointer; }
+        .composer button { border: 0; border-radius: 14px; min-width: 96px; padding: 0 20px; background: #7c3aed; color: white; font-weight: 700; cursor: pointer; }
         .composer button:disabled { opacity: .45; cursor: not-allowed; }
         .start-card { text-align: center; color: #8d94a4; margin: 80px auto; }
         .start-card.centered { margin: auto; }
