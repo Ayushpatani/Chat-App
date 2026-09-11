@@ -39,17 +39,37 @@ const startServer = async () => {
 
   const onlineUsers = new Map();
 
-  const broadcastPresence = () => {
-    io.emit('online_users', Array.from(onlineUsers.keys()));
-  };
+  const currentOnlineUsers = () => Array.from(onlineUsers.keys());
+  const broadcastPresence = () => io.emit('online_users', currentOnlineUsers());
 
   io.on('connection', (socket) => {
+    socket.emit('online_users', currentOnlineUsers());
+
     socket.on('join', (userId) => {
       if (!userId) return;
-      socket.data.userId = String(userId);
-      socket.join(String(userId));
-      onlineUsers.set(String(userId), (onlineUsers.get(String(userId)) || 0) + 1);
+
+      const normalizedUserId = String(userId);
+      const previousUserId = socket.data.userId;
+
+      if (previousUserId === normalizedUserId) {
+        socket.emit('online_users', currentOnlineUsers());
+        return;
+      }
+
+      if (previousUserId) {
+        const previousCount = (onlineUsers.get(previousUserId) || 1) - 1;
+        if (previousCount <= 0) onlineUsers.delete(previousUserId);
+        else onlineUsers.set(previousUserId, previousCount);
+      }
+
+      socket.data.userId = normalizedUserId;
+      socket.join(normalizedUserId);
+      onlineUsers.set(normalizedUserId, (onlineUsers.get(normalizedUserId) || 0) + 1);
       broadcastPresence();
+    });
+
+    socket.on('request_presence', () => {
+      socket.emit('online_users', currentOnlineUsers());
     });
 
     socket.on('send_message', (msg) => {
@@ -66,12 +86,15 @@ const startServer = async () => {
     });
 
     socket.on('messages_seen', ({ by, withUser }) => {
-      if (by && withUser) io.to(String(withUser)).emit('messages_seen', { by: String(by) });
+      if (by && withUser) {
+        io.to(String(withUser)).emit('messages_seen', { by: String(by) });
+      }
     });
 
     socket.on('disconnect', () => {
       const userId = socket.data.userId;
       if (!userId) return;
+
       const remaining = (onlineUsers.get(userId) || 1) - 1;
       if (remaining <= 0) onlineUsers.delete(userId);
       else onlineUsers.set(userId, remaining);
