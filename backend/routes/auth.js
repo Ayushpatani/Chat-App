@@ -7,140 +7,128 @@ const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
 
-const userModels = require('../models/userModels');
-const fetchuser = require("../middleware/fetch");
+const User = require('../models/userModels');
+const fetchuser = require('../middleware/fetch');
 
-const JWT_SECRET = process.env.JWT_SECRET || "prashant";
+const JWT_SECRET = process.env.JWT_SECRET || 'change-this-secret-in-production';
 
-// ✅ Ensure uploads folder exists
 const uploadDir = path.join(__dirname, '..', 'uploads');
 if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, { recursive: true });
+  fs.mkdirSync(uploadDir, { recursive: true });
 }
 
-// ✅ Serve uploads as static files (add this in server.js/app.js)
-const app = express();
-// app.use('/uploads', express.static(uploadDir)); // Make sure to add in main server file
-
-// Multer setup
 const storage = multer.diskStorage({
-    destination: function (req, file, cb) {
-        cb(null, uploadDir);
-    },
-    filename: function (req, file, cb) {
-        cb(null, Date.now() + '-' + file.originalname);
-    }
+  destination: (_req, _file, cb) => cb(null, uploadDir),
+  filename: (_req, file, cb) => {
+    const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
+    cb(null, `${Date.now()}-${safeName}`);
+  },
 });
-const upload = multer({ storage: storage });
 
-/* ROUTE 1: Create a user */
+const upload = multer({
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) return cb(null, true);
+    cb(new Error('Only image uploads are allowed'));
+  },
+});
+
 router.post(
-    '/createuser',
-    upload.single('pic'),
-    [
-        body('name', 'Name must be at least 6 characters').isLength({ min: 6 }),
-        body('email', 'Enter a valid Email').isEmail(),
-        body('password', 'Password must be at least 6 characters').isLength({ min: 6 })
-    ],
-    async (req, res) => {
-        let success = false;
-        const errors = validationResult(req);
-        if (!errors.isEmpty()) {
-            return res.status(400).json({ success, errors: errors.array() });
-        }
-
-        try {
-            const { name, email, password } = req.body;
-            const pic = req.file ? `http://localhost:8000/uploads/${req.file.filename}` : null;
-
-            console.log("hollo", pic)
-
-            let user = await userModels.findOne({ email });
-            if (user) {
-                return res.status(400).json({ success, error: "User with this email already exists." });
-            }
-
-            const salt = await bcrypt.genSalt(10);
-            const secPass = await bcrypt.hash(password, salt);
-
-            user = await userModels.create({
-                name,
-                email,
-                password: secPass,
-                pic
-            });
-
-            const data = { user: { id: user.id } };
-            const authtoken = jwt.sign(data, JWT_SECRET);
-
-            success = true;
-            res.json({ success, authtoken, user });
-
-        } catch (error) {
-            console.error("Error in createuser route:", error);
-            res.status(500).json({ success: false, error: "Internal Server Error" });
-        }
-    }
-);
-
-/* ROUTE 2: Login user */
-router.post('/login', [
-    body('email', 'Enter a valid Email').isEmail(),
-    body('password', 'Password is required').exists(),
-], async (req, res) => {
+  '/createuser',
+  upload.single('pic'),
+  [
+    body('name', 'Name must be at least 3 characters').trim().isLength({ min: 3 }),
+    body('email', 'Enter a valid email').isEmail().normalizeEmail(),
+    body('password', 'Password must be at least 6 characters').isLength({ min: 6 }),
+  ],
+  async (req, res) => {
     let success = false;
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-        return res.status(400).json({ success, errors: errors.array() });
+      return res.status(400).json({ success, errors: errors.array() });
     }
 
-    const { email, password } = req.body;
     try {
-        let user = await userModels.findOne({ email });
-        if (!user) {
-            return res.status(400).json({ success, error: "Invalid credentials" });
-        }
+      const { name, email, password } = req.body;
+      const pic = req.file ? `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}` : undefined;
 
-        const passwordCompare = await bcrypt.compare(password, user.password);
-        if (!passwordCompare) {
-            return res.status(400).json({ success, error: "Invalid credentials" });
-        }
+      const existingUser = await User.findOne({ email });
+      if (existingUser) {
+        return res.status(400).json({ success, error: 'User with this email already exists.' });
+      }
 
-        const data = { user: { id: user.id } };
-        const authtoken = jwt.sign(data, JWT_SECRET);
+      const salt = await bcrypt.genSalt(10);
+      const secPass = await bcrypt.hash(password, salt);
+      const user = await User.create({ name, email, password: secPass, ...(pic ? { pic } : {}) });
 
-        success = true;
-        res.json({ success, authtoken });
+      const authtoken = jwt.sign({ user: { id: user.id } }, JWT_SECRET, { expiresIn: '7d' });
+      success = true;
 
+      res.status(201).json({
+        success,
+        authtoken,
+        user: { _id: user._id, name: user.name, email: user.email, pic: user.pic },
+      });
     } catch (error) {
-        console.error("Error in login route:", error);
-        res.status(500).json({ success: false, error: "Internal Server Error" });
+      console.error('Error in createuser route:', error);
+      res.status(500).json({ success: false, error: 'Internal Server Error' });
     }
-});
+  }
+);
 
-/* ROUTE 3: Get user details */
+router.post(
+  '/login',
+  [
+    body('email', 'Enter a valid email').isEmail().normalizeEmail(),
+    body('password', 'Password is required').exists(),
+  ],
+  async (req, res) => {
+    let success = false;
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success, errors: errors.array() });
+    }
+
+    try {
+      const { email, password } = req.body;
+      const user = await User.findOne({ email });
+      if (!user) return res.status(400).json({ success, error: 'Invalid credentials' });
+
+      const passwordCompare = await bcrypt.compare(password, user.password);
+      if (!passwordCompare) return res.status(400).json({ success, error: 'Invalid credentials' });
+
+      const authtoken = jwt.sign({ user: { id: user.id } }, JWT_SECRET, { expiresIn: '7d' });
+      success = true;
+      res.json({ success, authtoken });
+    } catch (error) {
+      console.error('Error in login route:', error);
+      res.status(500).json({ success: false, error: 'Internal Server Error' });
+    }
+  }
+);
+
 router.get('/getuser', fetchuser, async (req, res) => {
-    try {
-        const userId = req.user.id;
-        const user = await userModels.findById(userId).select("-password");
-        res.json(user); // always return JSON
-    } catch (error) {
-        console.error("Error in getuser route:", error);
-        res.status(500).json({ success: false, error: "Internal Server Error" });
-    }
+  try {
+    const user = await User.findById(req.user.id).select('-password');
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json(user);
+  } catch (error) {
+    console.error('Error in getuser route:', error);
+    res.status(500).json({ success: false, error: 'Internal Server Error' });
+  }
 });
 
-router.get("/getalluser", async (req, res) => {
-    try {
-        const users = await userModels.find().select("name _id");
-        // keeps only name and _id
-        res.json(users);
-
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send("Server Error");
-    }
+router.get('/getalluser', fetchuser, async (req, res) => {
+  try {
+    const users = await User.find({ _id: { $ne: req.user.id } })
+      .select('name email pic _id')
+      .sort({ name: 1 });
+    res.json(users);
+  } catch (error) {
+    console.error('Error in getalluser route:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
 });
-
 
 module.exports = router;

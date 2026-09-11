@@ -1,23 +1,21 @@
 const jwt = require('jsonwebtoken');
-const JWT_SECRETE = "prashant";
+
+const JWT_SECRET = process.env.JWT_SECRET || 'change-this-secret-in-production';
 
 const fetchuser = (req, res, next) => {
+  const token = req.header('auth-token');
 
-    //GER the user form jwt token and add id to req object
-    const token = req.header('auth-token');
-    if (!token) {
-        res.status(401).send({ error: "Pleasse authenticate using valid token. " });
-    }
-    try {
-        const data = jwt.verify(token, JWT_SECRETE);
-        req.user = data.user;
-        console.log(data);
+  if (!token) {
+    return res.status(401).json({ error: 'Please authenticate using a valid token.' });
+  }
 
-        next();
-
-    } catch (error) {
-        res.status(401).send({ error: "Pleasse authenticate using valid token. " });
-    }
-}
+  try {
+    const data = jwt.verify(token, JWT_SECRET);
+    req.user = data.user;
+    next();
+  } catch (_error) {
+    return res.status(401).json({ error: 'Please authenticate using a valid token.' });
+  }
+};
 
 module.exports = fetchuser;
