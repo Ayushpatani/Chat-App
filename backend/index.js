@@ -1,95 +1,83 @@
-// server.js
+require('dotenv').config();
 const connectToMongo = require('./db');
-const express = require("express");
+const express = require('express');
 const cors = require('cors');
 const path = require('path');
 
-connectToMongo();
 const app = express();
-const port = 8000;
+const port = process.env.PORT || 8000;
+const clientUrl = process.env.CLIENT_URL || 'http://localhost:5173';
 
 app.use(cors({
-    origin: [ "http://localhost:5173"],
-    methods: ["GET", "POST"]
+  origin: clientUrl,
+  methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'],
+  credentials: true,
 }));
-
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
-
-// Serve uploads
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Routes
+app.get('/api/health', (_req, res) => res.json({ ok: true }));
 app.use('/api/auth', require('./routes/auth'));
-app.use("/api/message", require("./routes/message"));
+app.use('/api/message', require('./routes/message'));
 
-const server = app.listen(port, () => {
-    console.log(`Server running at http://localhost:${port}`);
-});
+const startServer = async () => {
+  await connectToMongo();
 
-// Socket.IO setup
-const io = require("socket.io")(server, {
+  const server = app.listen(port, () => {
+    console.log(`🚀 Server running at http://localhost:${port}`);
+  });
+
+  const io = require('socket.io')(server, {
     pingTimeout: 60000,
     cors: {
-        origin: ["http://localhost:5173"],
-        methods: ["GET", "POST"],
-        credentials: true   // add this
-    }
-});
+      origin: clientUrl,
+      methods: ['GET', 'POST'],
+      credentials: true,
+    },
+  });
 
-io.on("connection", (socket) => {
-    console.log("✅ User connected:", socket.id);
+  const onlineUsers = new Map();
 
-    // join personal room
-    socket.on("join", (userId) => {
-        socket.join(userId);
-        console.log(`🔑 User joined room: ${userId}`);
+  const broadcastPresence = () => {
+    io.emit('online_users', Array.from(onlineUsers.keys()));
+  };
+
+  io.on('connection', (socket) => {
+    socket.on('join', (userId) => {
+      if (!userId) return;
+      socket.data.userId = String(userId);
+      socket.join(String(userId));
+      onlineUsers.set(String(userId), (onlineUsers.get(String(userId)) || 0) + 1);
+      broadcastPresence();
     });
 
-    // one-to-one messaging
-    socket.on("send_message", (msg) => {
-        console.log("📩 Direct Message:", msg);
-        socket.to(msg.receiver).emit("receive_message", msg);
+    socket.on('send_message', (msg) => {
+      if (!msg?.receiver) return;
+      io.to(String(msg.receiver)).emit('receive_message', msg);
     });
 
-    // typing events
-    socket.on("typing", ({ sender, receiver }) => {
-        socket.to(receiver).emit("typing", sender);
+    socket.on('typing', ({ sender, receiver }) => {
+      if (sender && receiver) io.to(String(receiver)).emit('typing', String(sender));
     });
 
-    socket.on("stop_typing", ({ sender, receiver }) => {
-        socket.to(receiver).emit("stop_typing", sender);
+    socket.on('stop_typing', ({ sender, receiver }) => {
+      if (sender && receiver) io.to(String(receiver)).emit('stop_typing', String(sender));
     });
 
-    socket.on("disconnect", () => {
-        console.log("❌ User disconnected:", socket.id);
+    socket.on('messages_seen', ({ by, withUser }) => {
+      if (by && withUser) io.to(String(withUser)).emit('messages_seen', { by: String(by) });
     });
-});
 
-// socket.join(userId); :- This means the socket is now inside a room named after that userId. Multiple sockets (say if the same user is logged in on mobile + laptop) can join the same room.
+    socket.on('disconnect', () => {
+      const userId = socket.data.userId;
+      if (!userId) return;
+      const remaining = (onlineUsers.get(userId) || 1) - 1;
+      if (remaining <= 0) onlineUsers.delete(userId);
+      else onlineUsers.set(userId, remaining);
+      broadcastPresence();
+    });
+  });
+};
 
-// emit → Send an event
-//     You use it to send data to the other side (client → server OR server → client).
-//     You can name the event anything ("join", "message", "typing", etc.).
-//     You can also pass along data (payload).
-
-
-// on → Listen for an event :-You use it to listen and react when that event is received.
-
-
-// socket.emit(event, data)
-//     Sends an event only back to the same socket (the current client).
-//     It’s like replying to the person who just spoke.
-
-
-// io.emit(event, data)
-//     Sends an event to all connected sockets (broadcast to everyone).
-
-
-// io.to(roomId).emit(event, data)
-//     Sends an event to all sockets in a specific room.
-//     Perfect for private chats or group chats.
-
-// socket.to(roomId).emit(event, data)
-//     Sends an event to everyone in the room except the sender.
-//     Useful when you don’t want the sender to receive their own event.
+startServer();
